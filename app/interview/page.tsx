@@ -6,13 +6,15 @@
 import { useState, useRef, useEffect } from "react";
 import { Mic, PhoneOff, ArrowLeft, Volume2, Trophy, AlertTriangle, Quote, Loader2, Save } from "lucide-react";
 import Link from "next/link";
-import { supabase } from "../../lib/supabase";
+import { useRouter } from "next/navigation";
+import { createClient } from "../../lib/supabase/client";
 
 const SERVER_URL = "ws://localhost:8080";
 
 // ★重要: ここで入出力のレートを明確に分けます
 const INPUT_SAMPLE_RATE = 16000;  // マイクは16k (AIが聞き取りやすい)
 const OUTPUT_SAMPLE_RATE = 24000; // スピーカーは24k (Gemini 2.5の仕様)
+const INTERVIEW_DURATION_SEC = 10 * 60; // 10分タイマー
 
 type FeedbackData = {
   score: number;
@@ -95,38 +97,131 @@ const RadarChart = ({ metrics }: { metrics: FeedbackData['metrics'] }) => {
 };
 
 export default function InterviewPage() {
+  const router = useRouter();
+
+  // ✅ ブラウザ側のSupabaseクライアント（セッション保持あり）
+  const supabaseRef = useRef<ReturnType<typeof createClient> | null>(null);
+  if (!supabaseRef.current) supabaseRef.current = createClient();
+  const supabase = supabaseRef.current!;
+
   const [isConnected, setIsConnected] = useState(false);
   const [status, setStatus] = useState("準備完了");
   const [volume, setVolume] = useState(0);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [feedback, setFeedback] = useState<FeedbackData | null>(null);
   const [saveStatus, setSaveStatus] = useState<"saving" | "saved" | "error" | null>(null);
-  
+
+  // 10分タイマー
+  const [timeLeftSec, setTimeLeftSec] = useState<number>(INTERVIEW_DURATION_SEC);
+
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
 
-  useEffect(() => { return () => disconnectForce(); }, []);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoFinishedRef = useRef(false);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      disconnectForce();
+    };
+  }, []);
+
+  // ✅ ログインしていないユーザーは /login に戻す（OAuth直後などはセッション反映が遅いので少し待つ）
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkSession = async (attempt = 0) => {
+      const { data, error } = await supabase.auth.getSession();
+      const session = data.session;
+
+      // セッションがあればOK
+      if (!cancelled && !error && session) return;
+
+      // 直後はまだセッションが反映されていないことがあるので少しリトライ
+      if (!cancelled && attempt < 5) {
+        setTimeout(() => checkSession(attempt + 1), 300);
+        return;
+      }
+
+      // 最終的にセッションが無ければログインへ
+      if (!cancelled) {
+        router.replace("/login");
+      }
+    };
+
+    checkSession();
+
+    // 後からセッションが入るケースに備えて監視
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (cancelled) return;
+      if (session) {
+        // セッションが復活したのでOK
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      listener.subscription.unsubscribe();
+    };
+  }, [router, supabase]);
 
   const saveToSupabase = async (data: FeedbackData) => {
     setSaveStatus("saving");
     try {
-        const { error } = await supabase
-            .from('interviews')
-            .insert([{
-                score: data.score,
-                good_points: data.good_points,
-                advice: data.advice,
-                comment: data.comment,
-                metrics: data.metrics
-            }]);
-        if (error) throw error;
-        setSaveStatus("saved");
+      // ✅ セッションからユーザーIDを取得（安定）
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      const session = sessionData.session;
+      if (!session?.user) throw new Error("ログインしていないため保存できません");
+
+      // ✅ user_id を一緒に保存
+      const { error } = await supabase
+        .from("interviews")
+        .insert([
+          {
+            user_id: session.user.id,
+            score: data.score,
+            good_points: data.good_points,
+            advice: data.advice,
+            comment: data.comment,
+            metrics: data.metrics,
+          },
+        ]);
+
+      if (error) throw error;
+      setSaveStatus("saved");
     } catch (err) {
-        console.error("Supabase save error:", err);
-        setSaveStatus("error");
+      console.error("Supabase save error:", err);
+      setSaveStatus("error");
     }
+  };
+
+  const formatTime = (sec: number) => {
+    const m = Math.floor(sec / 60).toString().padStart(2, "0");
+    const s = Math.floor(sec % 60).toString().padStart(2, "0");
+    return `${m}:${s}`;
+  };
+
+  const clearTimer = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  const startTimer = () => {
+    clearTimer();
+    autoFinishedRef.current = false;
+    setTimeLeftSec(INTERVIEW_DURATION_SEC);
+    timerRef.current = setInterval(() => {
+      setTimeLeftSec((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
   };
 
   const connect = async () => {
@@ -146,7 +241,9 @@ export default function InterviewPage() {
       socketRef.current = ws;
 
       ws.onopen = async () => {
-        setIsConnected(true); setStatus("面接開始");
+        setIsConnected(true);
+        setStatus("面接開始");
+        startTimer();
         await startRecording(stream, ws);
       };
 
@@ -168,6 +265,7 @@ export default function InterviewPage() {
       };
 
       ws.onclose = () => {
+        clearTimer();
         setIsConnected(false);
         if (!isAnalyzing && !feedback) setStatus("通話終了");
       };
@@ -178,6 +276,7 @@ export default function InterviewPage() {
 
   const finishInterview = () => {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
+        clearTimer();
         setStatus("AIが採点中..."); setIsAnalyzing(true);
         socketRef.current.send(JSON.stringify({ type: "FINISH_INTERVIEW" }));
         stopRecording();
@@ -185,9 +284,23 @@ export default function InterviewPage() {
   };
 
   const disconnectForce = () => {
+    clearTimer();
+    autoFinishedRef.current = false;
+    setTimeLeftSec(INTERVIEW_DURATION_SEC);
     if (socketRef.current) { socketRef.current.close(); socketRef.current = null; }
-    stopRecording(); setIsConnected(false);
+    stopRecording();
+    setIsConnected(false);
   };
+
+  useEffect(() => {
+    if (!isConnected) return;
+    if (isAnalyzing) return;
+    if (timeLeftSec === 0 && !autoFinishedRef.current) {
+      autoFinishedRef.current = true;
+      setStatus("時間になりました。採点します...");
+      finishInterview();
+    }
+  }, [timeLeftSec, isConnected, isAnalyzing]);
 
   const startRecording = async (stream: MediaStream, ws: WebSocket) => {
     // ★ここが修正点: マイク入力は必ず 16000Hz に強制する
@@ -259,6 +372,14 @@ export default function InterviewPage() {
     <div className="h-screen bg-slate-50 flex flex-col items-center justify-center relative">
         <div className="bg-white p-10 rounded-3xl shadow-xl flex flex-col items-center max-w-md w-full border border-slate-100 z-10">
             <Link href="/" className="self-start text-slate-400 hover:text-slate-600 mb-6 flex items-center text-sm font-bold"><ArrowLeft className="w-4 h-4 mr-1" /> TOPへ戻る</Link>
+
+            {isConnected && !isAnalyzing && (
+              <div className="mb-4 w-full flex items-center justify-center">
+                <div className="px-4 py-2 rounded-full bg-slate-100 text-slate-700 text-sm font-bold">
+                  残り時間: <span className="text-slate-900">{formatTime(timeLeftSec)}</span>
+                </div>
+              </div>
+            )}
             
             <div className={`relative w-48 h-48 rounded-full flex items-center justify-center transition-all duration-300 mb-8 ${isConnected ? "bg-blue-50 shadow-inner" : "bg-slate-100"}`}>
                 {isConnected && !isAnalyzing && <div className="absolute inset-0 rounded-full bg-blue-500 opacity-20 animate-pulse" style={{ transform: `scale(${1 + volume})` }}></div>}

@@ -4,10 +4,11 @@
  */
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import Link from "next/link";
-import { ArrowLeft, Trophy, Calendar, Clock, ChevronRight, Activity } from "lucide-react";
-import { supabase } from "../../lib/supabase"; // 相対パスに注意
+import { useRouter } from "next/navigation";
+import { ArrowLeft, Trophy, Calendar, Clock, Activity } from "lucide-react";
+import { createClient } from "../../lib/supabase/client";
 
 // 型定義
 type InterviewRecord = {
@@ -66,26 +67,75 @@ const RadarChart = ({ metrics }: { metrics: InterviewRecord['metrics'] }) => {
   };
 
 export default function MyPage() {
+  const router = useRouter();
+
+  // ✅ ブラウザ側のSupabaseクライアント（セッション保持あり）
+  const supabaseRef = useRef<ReturnType<typeof createClient> | null>(null);
+  if (!supabaseRef.current) supabaseRef.current = createClient();
+  const supabase = supabaseRef.current!;
+
   const [records, setRecords] = useState<InterviewRecord[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // データ取得
+  // ✅ ログイン必須：自分の面接履歴だけ取得
   useEffect(() => {
-    const fetchData = async () => {
-      const { data, error } = await supabase
-        .from('interviews')
-        .select('*')
-        .order('created_at', { ascending: false }); // 新しい順
+    let cancelled = false;
 
-      if (error) {
-        console.error("Error fetching data:", error);
-      } else {
-        setRecords(data || []);
+    const load = async (attempt = 0) => {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      const session = sessionData.session;
+
+      // OAuth直後などでセッション反映が遅いことがあるので少しリトライ
+      if (!session && attempt < 5) {
+        setTimeout(() => {
+          if (!cancelled) load(attempt + 1);
+        }, 300);
+        return;
       }
-      setLoading(false);
+
+      // セッションが無ければログインへ
+      if (sessionError || !session) {
+        if (!cancelled) {
+          setLoading(false);
+          router.replace("/login");
+        }
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("interviews")
+        .select("id, created_at, score, good_points, advice, comment, metrics")
+        .eq("user_id", session.user.id)
+        .order("created_at", { ascending: false });
+
+      if (!cancelled) {
+        if (error) {
+          console.error("Error fetching data:", error);
+          setRecords([]);
+        } else {
+          setRecords((data as InterviewRecord[]) || []);
+        }
+        setLoading(false);
+      }
     };
-    fetchData();
-  }, []);
+
+    load();
+
+    // セッションが後から入る/切れるケースに備えて監視
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (cancelled) return;
+      if (!session) {
+        setRecords([]);
+        setLoading(false);
+        router.replace("/login");
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      listener.subscription.unsubscribe();
+    };
+  }, [router, supabase]);
 
   // 統計データの計算
   const averageScore = records.length > 0 
@@ -100,7 +150,16 @@ export default function MyPage() {
             <Link href="/" className="text-slate-500 hover:text-blue-600 flex items-center font-bold transition-colors">
                 <ArrowLeft className="w-5 h-5 mr-1" /> TOPに戻る
             </Link>
-            <h1 className="text-2xl font-bold text-slate-800">マイページ（面接履歴）</h1>
+
+            <div className="flex items-center gap-4">
+              <h1 className="text-2xl font-bold text-slate-800">マイページ（面接履歴）</h1>
+              <Link
+                href="/logout"
+                className="text-slate-500 hover:text-red-600 font-bold transition-colors"
+              >
+                ログアウト
+              </Link>
+            </div>
         </div>
 
         {/* 統計カード */}
