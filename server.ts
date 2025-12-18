@@ -7,6 +7,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { Buffer } from 'node:buffer';
 
 dotenv.config({ path: '.env.local' });
+const PORT = Number(process.env.PORT) || 8080;
 
 const API_KEY = process.env.GEMINI_API_KEY;
 if (!API_KEY) {
@@ -25,9 +26,9 @@ const JUDGE_MODEL = "gemini-2.0-flash-exp";
 const genAI = new GoogleGenerativeAI(API_KEY);
 const judgeModel = genAI.getGenerativeModel({ model: JUDGE_MODEL });
 
-const wss = new WebSocketServer({ port: 8080 });
+const wss = new WebSocketServer({ port: PORT, host: "0.0.0.0" });
 
-console.log(`📞 面接サーバー(レーダーチャート対応)が起動しました`);
+console.log(`📞 面接サーバー(レーダーチャート対応)が起動しました :${PORT}`);
 
 wss.on('connection', (clientWs: WebSocket) => {
   console.log("👤 接続");

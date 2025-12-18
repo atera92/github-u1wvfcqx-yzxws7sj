@@ -9,7 +9,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { createClient } from "../../lib/supabase/client";
 
-const SERVER_URL = "ws://localhost:8080";
+const SERVER_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080";
 
 // ★重要: ここで入出力のレートを明確に分けます
 const INPUT_SAMPLE_RATE = 16000;  // マイクは16k (AIが聞き取りやすい)
