@@ -120,6 +120,7 @@ export default function InterviewPage() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
+  const sessionIdRef = useRef<string | null>(null);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoFinishedRef = useRef(false);
@@ -302,7 +303,7 @@ export default function InterviewPage() {
     }
     if (isConnectingRef.current) return;
     isConnectingRef.current = true;
-    const ws = new WebSocket(SERVER_URL);
+    const ws = new WebSocket(buildWsUrl());
     socketRef.current = ws;
 
     ws.onopen = async () => {
@@ -360,6 +361,7 @@ export default function InterviewPage() {
       setStatus("接続中...");
       resetReconnectState();
       shouldReconnectRef.current = true;
+      ensureSessionId();
       const stream = await ensureStream();
       openSocket(stream);
     } catch (error) {
@@ -386,6 +388,7 @@ export default function InterviewPage() {
     autoFinishedRef.current = false;
     setTimeLeftSec(INTERVIEW_DURATION_SEC);
     hasStartedRef.current = false;
+    sessionIdRef.current = null;
     if (socketRef.current) { socketRef.current.close(); socketRef.current = null; }
     stopRecording(true);
     setIsConnected(false);
@@ -446,6 +449,22 @@ export default function InterviewPage() {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+  };
+
+  const ensureSessionId = () => {
+    if (sessionIdRef.current) return;
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+      sessionIdRef.current = crypto.randomUUID();
+      return;
+    }
+    sessionIdRef.current = `sid-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  };
+
+  const buildWsUrl = () => {
+    ensureSessionId();
+    const url = new URL(SERVER_URL);
+    url.searchParams.set("sid", sessionIdRef.current!);
+    return url.toString();
   };
 
   const playAudio = async (base64String: string) => {
