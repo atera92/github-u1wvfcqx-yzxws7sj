@@ -4,6 +4,11 @@ import { NextResponse, type NextRequest } from "next/server";
 
 export async function GET(request: NextRequest) {
   const { origin } = new URL(request.url);
+  return NextResponse.redirect(`${origin}/login`);
+}
+
+export async function POST(request: NextRequest) {
+  const { origin } = new URL(request.url);
   const cookieStore = cookies();
   const response = NextResponse.redirect(`${origin}/login`);
 

@@ -24,9 +24,11 @@ export default async function Home() {
             <span style={{ fontSize: 12, color: "#64748b", fontWeight: 700 }}>
               ログイン中: {user.email ?? user.id}
             </span>
-            <Link href="/logout" style={{ fontWeight: 700, color: "#dc2626" }}>
-              ログアウト
-            </Link>
+            <form action="/logout" method="post">
+              <button type="submit" style={{ fontWeight: 700, color: "#dc2626" }}>
+                ログアウト
+              </button>
+            </form>
           </div>
         ) : (
           <Link href="/login" style={{ fontWeight: 700, color: "#2563eb" }}>
