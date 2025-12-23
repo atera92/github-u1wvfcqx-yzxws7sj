@@ -1,9 +1,11 @@
 import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
 import { NextResponse, type NextRequest } from "next/server";
 
 export async function GET(request: NextRequest) {
   const { origin } = new URL(request.url);
-  let response = NextResponse.redirect(`${origin}/login`);
+  const cookieStore = cookies();
+  const response = NextResponse.redirect(`${origin}/login`);
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -11,11 +13,11 @@ export async function GET(request: NextRequest) {
     {
       cookies: {
         getAll() {
-          return request.cookies.getAll();
+          return cookieStore.getAll();
         },
         setAll(cookiesToSet) {
           cookiesToSet.forEach(({ name, value, options }) => {
-            response.cookies.set(name, value, options);
+            cookieStore.set(name, value, options);
           });
         },
       },
