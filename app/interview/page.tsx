@@ -110,17 +110,27 @@ export default function InterviewPage() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [feedback, setFeedback] = useState<FeedbackData | null>(null);
   const [saveStatus, setSaveStatus] = useState<"saving" | "saved" | "error" | null>(null);
+  const [isReconnecting, setIsReconnecting] = useState(false);
 
   // 10分タイマー
   const [timeLeftSec, setTimeLeftSec] = useState<number>(INTERVIEW_DURATION_SEC);
 
   const socketRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoFinishedRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const shouldReconnectRef = useRef(false);
+  const isConnectingRef = useRef(false);
+  const hasStartedRef = useRef(false);
+  const feedbackRef = useRef<FeedbackData | null>(null);
+  const isAnalyzingRef = useRef(false);
+  const MAX_RECONNECTS = 5;
 
   useEffect(() => {
     return () => {
@@ -128,9 +138,21 @@ export default function InterviewPage() {
         clearInterval(timerRef.current);
         timerRef.current = null;
       }
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       disconnectForce();
     };
   }, []);
+ 
+  useEffect(() => {
+    feedbackRef.current = feedback;
+  }, [feedback]);
+
+  useEffect(() => {
+    isAnalyzingRef.current = isAnalyzing;
+  }, [isAnalyzing]);
 
   // ✅ ログインしていないユーザーは /login に戻す（OAuth直後などはセッション反映が遅いので少し待つ）
   useEffect(() => {
@@ -215,13 +237,120 @@ export default function InterviewPage() {
     }
   };
 
-  const startTimer = () => {
+  const startTimer = (reset = true) => {
     clearTimer();
-    autoFinishedRef.current = false;
-    setTimeLeftSec(INTERVIEW_DURATION_SEC);
+    if (reset) {
+      autoFinishedRef.current = false;
+      setTimeLeftSec(INTERVIEW_DURATION_SEC);
+    }
     timerRef.current = setInterval(() => {
       setTimeLeftSec((prev) => (prev > 0 ? prev - 1 : 0));
     }, 1000);
+  };
+
+  const resetReconnectState = () => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    reconnectAttemptsRef.current = 0;
+    setIsReconnecting(false);
+  };
+
+  const ensureStream = async () => {
+    if (streamRef.current) return streamRef.current;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    streamRef.current = stream;
+    return stream;
+  };
+
+  const scheduleReconnect = async () => {
+    if (!shouldReconnectRef.current) return;
+    if (reconnectTimerRef.current) return;
+    if (reconnectAttemptsRef.current >= MAX_RECONNECTS) {
+      setIsReconnecting(false);
+      setStatus("接続が切れました。再接続できませんでした");
+      shouldReconnectRef.current = false;
+      return;
+    }
+    const attempt = reconnectAttemptsRef.current + 1;
+    const delayMs = Math.min(1000 * 2 ** (attempt - 1), 10000);
+    setIsReconnecting(true);
+    setStatus(`再接続中... (${attempt}/${MAX_RECONNECTS})`);
+    reconnectTimerRef.current = setTimeout(async () => {
+      reconnectTimerRef.current = null;
+      reconnectAttemptsRef.current = attempt;
+      try {
+        const stream = await ensureStream();
+        openSocket(stream, true);
+      } catch (error) {
+        console.error(error);
+        scheduleReconnect();
+      }
+    }, delayMs);
+  };
+
+  const openSocket = (stream: MediaStream, isReconnect = false) => {
+    if (socketRef.current?.readyState === WebSocket.OPEN || socketRef.current?.readyState === WebSocket.CONNECTING) {
+      return;
+    }
+    if (isConnectingRef.current) return;
+    isConnectingRef.current = true;
+    const ws = new WebSocket(SERVER_URL);
+    socketRef.current = ws;
+
+    ws.onopen = async () => {
+      isConnectingRef.current = false;
+      setIsConnected(true);
+      setIsReconnecting(false);
+      if (!hasStartedRef.current) {
+        setStatus("面接開始");
+        startTimer(true);
+        await startRecording(stream);
+        hasStartedRef.current = true;
+      } else {
+        setStatus(isReconnect ? "通話再開" : "面接開始");
+        startTimer(false);
+      }
+    };
+
+    ws.onmessage = async (event) => {
+      try {
+        const data = JSON.parse(event.data.toString());
+        if (data.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
+          const base64Audio = data.serverContent.modelTurn.parts[0].inlineData.data;
+          playAudio(base64Audio);
+        }
+        if (data.type === "FEEDBACK_RESULT") {
+          const resultData = data.data;
+          setFeedback(resultData);
+          setIsAnalyzing(false);
+          disconnectForce();
+          saveToSupabase(resultData);
+        }
+      } catch (e) {}
+    };
+
+    ws.onerror = () => {
+      ws.close();
+    };
+
+    ws.onclose = () => {
+      isConnectingRef.current = false;
+      clearTimer();
+      setIsConnected(false);
+      if (shouldReconnectRef.current && !isAnalyzingRef.current && !feedbackRef.current) {
+        scheduleReconnect();
+        return;
+      }
+      if (!isAnalyzingRef.current && !feedbackRef.current) setStatus("通話終了");
+    };
   };
 
   const connect = async () => {
@@ -229,48 +358,13 @@ export default function InterviewPage() {
       setFeedback(null);
       setSaveStatus(null);
       setStatus("接続中...");
-      
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true
-          } 
-      });
-      const ws = new WebSocket(SERVER_URL);
-      socketRef.current = ws;
-
-      ws.onopen = async () => {
-        setIsConnected(true);
-        setStatus("面接開始");
-        startTimer();
-        await startRecording(stream, ws);
-      };
-
-      ws.onmessage = async (event) => {
-        try {
-            const data = JSON.parse(event.data.toString());
-            if (data.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
-                const base64Audio = data.serverContent.modelTurn.parts[0].inlineData.data;
-                playAudio(base64Audio);
-            }
-            if (data.type === "FEEDBACK_RESULT") {
-                const resultData = data.data;
-                setFeedback(resultData);
-                setIsAnalyzing(false);
-                disconnectForce();
-                saveToSupabase(resultData);
-            }
-        } catch (e) {}
-      };
-
-      ws.onclose = () => {
-        clearTimer();
-        setIsConnected(false);
-        if (!isAnalyzing && !feedback) setStatus("通話終了");
-      };
+      resetReconnectState();
+      shouldReconnectRef.current = true;
+      const stream = await ensureStream();
+      openSocket(stream);
     } catch (error) {
-      console.error(error); setStatus("エラー");
+      console.error(error);
+      setStatus("エラー");
     }
   };
 
@@ -278,17 +372,22 @@ export default function InterviewPage() {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
         clearTimer();
         setStatus("AIが採点中..."); setIsAnalyzing(true);
+        shouldReconnectRef.current = false;
+        resetReconnectState();
         socketRef.current.send(JSON.stringify({ type: "FINISH_INTERVIEW" }));
-        stopRecording();
+        stopRecording(true);
     } else { disconnectForce(); }
   };
 
   const disconnectForce = () => {
+    shouldReconnectRef.current = false;
+    resetReconnectState();
     clearTimer();
     autoFinishedRef.current = false;
     setTimeLeftSec(INTERVIEW_DURATION_SEC);
+    hasStartedRef.current = false;
     if (socketRef.current) { socketRef.current.close(); socketRef.current = null; }
-    stopRecording();
+    stopRecording(true);
     setIsConnected(false);
   };
 
@@ -302,7 +401,8 @@ export default function InterviewPage() {
     }
   }, [timeLeftSec, isConnected, isAnalyzing]);
 
-  const startRecording = async (stream: MediaStream, ws: WebSocket) => {
+  const startRecording = async (stream: MediaStream) => {
+    if (audioContextRef.current) return;
     // ★ここが修正点: マイク入力は必ず 16000Hz に強制する
     // これをしないと、AIがあなたの声を認識できません
     const audioContext = new window.AudioContext({ sampleRate: INPUT_SAMPLE_RATE });
@@ -326,15 +426,26 @@ export default function InterviewPage() {
       // 音量が出ているかログで確認
       if (vol > 0.01) console.log("Mic Input Volume:", vol);
 
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ realtime_input: { media_chunks: [{ mime_type: "audio/pcm", data: float32ToBase64(audioData) }] } }));
+      const ws = socketRef.current;
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            realtime_input: {
+              media_chunks: [{ mime_type: "audio/pcm", data: float32ToBase64(audioData) }],
+            },
+          })
+        );
       }
     };
   };
 
-  const stopRecording = () => {
+  const stopRecording = (stopTracks = false) => {
     if (audioContextRef.current) { audioContextRef.current.close(); audioContextRef.current = null; }
     audioWorkletNodeRef.current = null;
+    if (stopTracks && streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
   };
 
   const playAudio = async (base64String: string) => {
@@ -390,7 +501,13 @@ export default function InterviewPage() {
             <p className="text-slate-500 mb-8 text-center text-sm">{isConnected ? "音声会話中" : "ボタンを押して面接を開始"}</p>
 
             {!isConnected ? (
-                <button onClick={connect} className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-lg shadow-lg transition-transform active:scale-95 flex items-center justify-center"><Mic className="w-5 h-5 mr-2" /> 面接を始める</button>
+                isReconnecting ? (
+                  <button disabled className="w-full py-4 bg-slate-400 text-white rounded-xl font-bold text-lg shadow-lg flex items-center justify-center">
+                    <Loader2 className="w-5 h-5 mr-2 animate-spin" /> 再接続中...
+                  </button>
+                ) : (
+                  <button onClick={connect} className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-lg shadow-lg transition-transform active:scale-95 flex items-center justify-center"><Mic className="w-5 h-5 mr-2" /> 面接を始める</button>
+                )
             ) : (
                 <button onClick={finishInterview} disabled={isAnalyzing} className={`w-full py-4 ${isAnalyzing ? "bg-slate-400" : "bg-red-500 hover:bg-red-600"} text-white rounded-xl font-bold text-lg shadow-lg transition-transform active:scale-95 flex items-center justify-center`}><PhoneOff className="w-5 h-5 mr-2" /> {isAnalyzing ? "採点中..." : "面接終了・採点"}</button>
             )}
