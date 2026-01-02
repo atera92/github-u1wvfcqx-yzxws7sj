@@ -1,6 +1,50 @@
 /* 必要最低限のスタイルのみ */
+:root {
+  --bg: #f6f1ea;
+  --bg-soft: #fff8f1;
+  --ink: #141518;
+  --muted: #6b6f76;
+  --accent: #0f766e;
+  --accent-2: #c7772f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
 body {
   margin: 0;
   padding: 0;
-  font-family: sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body), "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+
+@keyframes rise {
+  0% {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-12px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }
